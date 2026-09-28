@@ -1,5 +1,5 @@
 
-import re, sqlite3, requests, time, io
+import re, sqlite3, requests, time, io, hashlib
 import pdfplumber
 from datetime import datetime
 import pandas as pd
@@ -26,6 +26,8 @@ def cx():
     c.execute("""CREATE TABLE IF NOT EXISTS fundamentals(
       ticker TEXT PRIMARY KEY,cik TEXT,company TEXT,assets REAL,liabilities REAL,revenue REAL,
       net_income REAL,equity REAL,shares REAL,sec_updated TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS import_keys(
+      tx_key TEXT PRIMARY KEY, filing_id TEXT, created TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS watchlist(
       kind TEXT,value TEXT,created TEXT,UNIQUE(kind,value))""")
     c.execute("""CREATE TABLE IF NOT EXISTS alert_rules(
@@ -42,6 +44,26 @@ def amount_range(s):
 
 def ticker_from_asset(s):
     m=re.findall(r"\(([A-Z][A-Z0-9.\-]{0,7})\)",str(s));return m[-1] if m else None
+
+
+def norm(v):
+    return re.sub(r"\s+"," ",str(v or "")).strip().upper()
+
+def stable_tx_key(row):
+    # row layout: filing_id,name,chamber,ticker,asset,tx,trade_date,notification_date,amount,lo,hi,url
+    # Deliberately exclude politician name/source URL and normalized numeric range; the filing and
+    # transaction fields identify the disclosed line while remaining stable across presentation changes.
+    parts=[row[0], row[2], row[3], row[4], row[5], row[6], row[7], row[8]]
+    return hashlib.sha256("|".join(norm(x) for x in parts).encode("utf-8")).hexdigest()
+
+def bootstrap_import_keys(c):
+    # Register already-imported rows so upgrading from V6.2 doesn't reinsert them.
+    rows=c.execute('SELECT filing_id,politician,chamber,ticker,asset,"transaction",trade_date,notification_date,amount,amount_low,amount_high,source_url FROM trades').fetchall()
+    for row in rows:
+        k=stable_tx_key(row)
+        c.execute("INSERT OR IGNORE INTO import_keys(tx_key,filing_id,created) VALUES(?,?,?)",
+                  (k,str(row[0]),str(datetime.now())))
+    c.commit()
 
 @st.cache_data(ttl=21600)
 def house_index(year):
@@ -96,14 +118,45 @@ def parse_ptr(docid,name,year):
 
 def refresh_house(year,limit=150):
     idx=house_index(year).sort_values("FilingDate",ascending=False).head(limit)
-    c=cx();n=0;parsed=0
+    c=cx()
+    bootstrap_import_keys(c)
+    filings_checked=0
+    rows_detected=0
+    inserted=0
+    duplicates=0
+    parse_empty=0
+
     for _,r in idx.iterrows():
+        filings_checked += 1
         rows=parse_ptr(r.DocID,f'{r["First"]} {r["Last"]}'.strip(),year)
-        parsed+=len(rows)
+        if not rows:
+            parse_empty += 1
+            continue
+
+        # De-dupe within a single PDF too.
+        unique_rows={}
         for row in rows:
-            n+=c.execute("INSERT OR IGNORE INTO trades VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",row).rowcount
+            unique_rows[stable_tx_key(row)] = row
+        rows_detected += len(unique_rows)
+
+        for k,row in unique_rows.items():
+            exists=c.execute("SELECT 1 FROM import_keys WHERE tx_key=?",(k,)).fetchone()
+            if exists:
+                duplicates += 1
+                continue
+            c.execute("INSERT OR IGNORE INTO trades VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",row)
+            c.execute("INSERT OR IGNORE INTO import_keys(tx_key,filing_id,created) VALUES(?,?,?)",
+                      (k,str(row[0]),str(datetime.now())))
+            inserted += 1
+
     c.commit();c.close()
-    return n
+    return {
+        "filings_checked":filings_checked,
+        "rows_detected":rows_detected,
+        "inserted":inserted,
+        "duplicates":duplicates,
+        "empty_filings":parse_empty
+    }
 
 @st.cache_data(ttl=86400)
 def ticker_map():
@@ -221,7 +274,16 @@ with st.sidebar:
     page=st.radio("View",["Home","Discover","Watchlist","Alerts","Backtests","Politicians","Companies","Data Quality","Sources"])
     st.divider()
     if st.button("Refresh House"):
-        st.success(f"{refresh_house(datetime.now().year)} new transaction rows imported.")
+        with st.spinner("Checking official House filings…"):
+            result=refresh_house(datetime.now().year)
+        st.success(
+            f'{result["filings_checked"]} filings checked • '
+            f'{result["rows_detected"]} transactions detected • '
+            f'{result["inserted"]} new • '
+            f'{result["duplicates"]} already stored'
+        )
+        if result["empty_filings"]:
+            st.caption(f'{result["empty_filings"]} filings returned no parseable transaction table and remain a data-quality check.')
     if st.button("Refresh SEC"):
         d0=load(False);st.success(f"{refresh_sec(d0.ticker.dropna().tolist() if len(d0) else [])} companies.")
     if st.button("Update backtests"):
