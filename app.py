@@ -7,7 +7,7 @@ import numpy as np
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Politician Trade Research V6.7.7.6",layout="wide",initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Politician Trade Research V6.8.8.7.6",layout="wide",initial_sidebar_state="collapsed")
 DB="politician_trades.db"; HOUSE="https://disclosures-clerk.house.gov"
 SEC="https://data.sec.gov"; SEC_WWW="https://www.sec.gov"
 UA={"User-Agent":"PoliticianTradeResearch personal research contact@example.com"}
@@ -365,31 +365,64 @@ def backtest(ticker,report,benchmark="SPY"):
         z[f"r{h}"]=sr;z[f"b{h}"]=br;z[f"excess{h}"]=None if sr is None or br is None else sr-br
     return z
 
-def run_backtests(maxrows=25,progress=None):
+def _bt_key(r):
+    return (str(r.filing_id),str(r.chamber),str(r.ticker),str(pd.Timestamp(r.notification_date).date()))
+
+def backtest_queue():
     d=load(False)
     d=d[d.transaction.astype(str).str.upper().str.startswith("P")].dropna(subset=["ticker","notification_date"])
     c=cx()
     done=pd.read_sql("SELECT filing_id,chamber,ticker,notification_date FROM backtests",c)
-    keys=set()
-    for _,r in done.iterrows():
-        keys.add((str(r.filing_id),str(r.chamber),str(r.ticker),str(pd.Timestamp(r.notification_date).date())))
+    unavailable=pd.read_sql("SELECT item FROM enrichment_status WHERE kind='BACKTEST' AND status='unavailable'",c)
+    c.close()
+    done_keys={(str(r.filing_id),str(r.chamber),str(r.ticker),str(pd.Timestamp(r.notification_date).date())) for _,r in done.iterrows()}
+    unavailable_keys=set(unavailable.item.astype(str).tolist()) if len(unavailable) else set()
     candidates=[]
     for _,r in d.sort_values("notification_date",ascending=False).iterrows():
-        k=(str(r.filing_id),str(r.chamber),str(r.ticker),str(pd.Timestamp(r.notification_date).date()))
-        if k not in keys:candidates.append(r)
-    todo=candidates[:maxrows];n=0;failed=0
+        k=_bt_key(r); ks="|".join(k)
+        if k not in done_keys and ks not in unavailable_keys:candidates.append(r)
+    return candidates
+
+def run_backtests(maxrows=25,progress=None):
+    candidates=backtest_queue();todo=candidates[:maxrows]
+    c=cx();n=0;failed=0
     for i,r in enumerate(todo,1):
+        k=_bt_key(r);ks="|".join(k)
+        err=None
         try:z=backtest(r.ticker,r.notification_date)
-        except:z=None
+        except Exception as e:z=None;err=f"{type(e).__name__}: {e}"[:500]
         if z:
             c.execute("INSERT OR REPLACE INTO backtests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (r.filing_id,r.chamber,r.ticker,str(r.notification_date.date()),z["entry_date"],z["entry_price"],
                z["r30"],z["r90"],z["r180"],z["b30"],z["b90"],z["b180"],z["excess30"],z["excess90"],z["excess180"],str(datetime.now())))
+            c.execute("""INSERT INTO enrichment_status(kind,item,status,attempts,last_error,updated)
+                         VALUES('BACKTEST',?,'ok',1,NULL,?)
+                         ON CONFLICT(kind,item) DO UPDATE SET status='ok',attempts=enrichment_status.attempts+1,last_error=NULL,updated=excluded.updated""",
+                      (ks,str(datetime.now())))
             c.commit();n+=1
-        else: failed+=1
+        else:
+            msg=err or "No usable ticker/benchmark price series after public notification date."
+            c.execute("""INSERT INTO enrichment_status(kind,item,status,attempts,last_error,updated)
+                         VALUES('BACKTEST',?,'unavailable',1,?,?)
+                         ON CONFLICT(kind,item) DO UPDATE SET status='unavailable',attempts=enrichment_status.attempts+1,last_error=excluded.last_error,updated=excluded.updated""",
+                      (ks,msg,str(datetime.now())))
+            c.commit();failed+=1
         if progress:progress.progress(i/max(1,len(todo)),text=f"Backtest {i}/{len(todo)}: {r.ticker}")
     c.close();st.cache_data.clear()
     return {"processed":len(todo),"saved":n,"failed":failed,"remaining":max(0,len(candidates)-len(todo))}
+
+def run_backfill(batch_size=25,max_batches=8,progress=None):
+    total_saved=0;total_unavailable=0;batches=0
+    for b in range(max_batches):
+        before=len(backtest_queue())
+        if before==0:break
+        r=run_backtests(batch_size)
+        total_saved+=r["saved"];total_unavailable+=r["failed"];batches+=1
+        after=len(backtest_queue())
+        if progress:
+            progress.progress((b+1)/max_batches,text=f"Backfill batch {b+1}: {after} remaining")
+        if after>=before:break
+    return {"batches":batches,"saved":total_saved,"failed":total_unavailable,"remaining":len(backtest_queue())}
 
 def load(with_f=True):
     c=cx();t=pd.read_sql("SELECT * FROM trades",c);b=pd.read_sql("SELECT * FROM backtests",c);f=pd.read_sql("SELECT * FROM fundamentals",c);c.close()
@@ -435,7 +468,7 @@ def cluster_counts(x):
         out.append(w.politician.nunique())
     return out
 
-st.title("Politician Trade Research V6.7.7.6")
+st.title("Politician Trade Research V6.8.8.7.6")
 st.caption("Mobile-ready research dashboard • data quality • watchlist • alert rules • backtests")
 
 with st.sidebar:
@@ -491,6 +524,11 @@ with st.sidebar:
         bar=st.progress(0,text="Preparing backtest batch…");r=run_backtests(25,progress=bar);bar.empty()
         st.success(f'{r["saved"]} backtests saved • {r["failed"]} unavailable • {r["remaining"]} remaining')
         if r["remaining"]>0: st.caption("Press again later to continue. Existing backtests are skipped.")
+    if st.button("Backfill remaining backtests"):
+        bar=st.progress(0,text="Starting controlled backfill…")
+        r=run_backfill(batch_size=25,max_batches=8,progress=bar);bar.empty()
+        st.success(f'{r["saved"]} saved • {r["failed"]} unavailable • {r["remaining"]} remaining • {r["batches"]} batches')
+        if r["remaining"]>0:st.caption("Run again later to continue. Completed and unavailable cases are skipped.")
 
 d=load()
 
@@ -558,6 +596,14 @@ elif page=="Backtests":
         c3.metric("Beat SPY",f"{(y[ec]>0).mean():.1%}" if len(y) else "—")
         c4.metric("Median excess",f"{y[ec].median():.1%}" if len(y) else "—")
         st.dataframe(y.sort_values("notification_date",ascending=False),use_container_width=True,hide_index=True)
+        st.subheader("Validation sample")
+        st.caption("Public notification date is the signal date. Entry is the first common trading date after that date.")
+        cols=[c for c in ["politician","ticker","trade_date","notification_date","entry_date","entry_price",
+                          "r30","b30","excess30","r90","b90","excess90","r180","b180","excess180","source_url"] if c in y.columns]
+        sample=y.sort_values("notification_date",ascending=False)[cols].head(20).copy()
+        for c in ["r30","b30","excess30","r90","b90","excess90","r180","b180","excess180"]:
+            if c in sample:sample[c]=sample[c].map(lambda v: None if pd.isna(v) else f"{v:.2%}")
+        st.dataframe(sample,use_container_width=True,hide_index=True)
 
 elif page=="Politicians":
     if len(d):
