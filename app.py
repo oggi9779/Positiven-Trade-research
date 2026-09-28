@@ -14,9 +14,9 @@ UA={"User-Agent":"PoliticianTradeResearch personal research contact@example.com"
 def cx():
     c=sqlite3.connect(DB)
     c.execute("""CREATE TABLE IF NOT EXISTS trades(
-      filing_id TEXT,politician TEXT,chamber TEXT,ticker TEXT,asset TEXT,transaction TEXT,
+      filing_id TEXT,politician TEXT,chamber TEXT,ticker TEXT,asset TEXT,"transaction" TEXT,
       trade_date TEXT,notification_date TEXT,amount TEXT,amount_low REAL,amount_high REAL,
-      source_url TEXT,UNIQUE(filing_id,chamber,ticker,asset,transaction,trade_date,amount))""")
+      source_url TEXT,UNIQUE(filing_id,chamber,ticker,asset,"transaction",trade_date,amount))""")
     c.execute("""CREATE TABLE IF NOT EXISTS backtests(
       filing_id TEXT,chamber TEXT,ticker TEXT,notification_date TEXT,entry_date TEXT,entry_price REAL,
       r30 REAL,r90 REAL,r180 REAL,b30 REAL,b90 REAL,b180 REAL,
