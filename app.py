@@ -1,5 +1,6 @@
 
-import re, sqlite3, requests, time
+import re, sqlite3, requests, time, io
+import pdfplumber
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -50,25 +51,59 @@ def house_index(year):
     return d[d.FilingType.astype(str).str.contains("P",case=False,na=False)]
 
 @st.cache_data(ttl=21600)
-def parse_ptr(docid,name):
-    url=f"{HOUSE}/public_disc/ptr-pdfs/{docid}.pdf";out=[]
-    try:tables=pd.read_html(url)
-    except:return out
-    for t in tables:
-        t.columns=[str(c).strip() for c in t.columns]
-        if not {"Asset","Transaction Type","Date","Notification Date","Amount"}.issubset(t.columns):continue
-        for _,r in t.iterrows():
-            lo,hi=amount_range(r["Amount"]);asset=str(r["Asset"])
-            out.append((str(docid),name,"House",ticker_from_asset(asset),asset,str(r["Transaction Type"]),
-                        str(r["Date"]),str(r["Notification Date"]),str(r["Amount"]),lo,hi,url))
+def parse_ptr(docid,name,year):
+    # Official House PTR PDFs live in a YEAR subdirectory.
+    url=f"{HOUSE}/public_disc/ptr-pdfs/{int(year)}/{docid}.pdf"
+    out=[]
+    try:
+        raw=http(url).content
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            for page in pdf.pages:
+                for table in (page.extract_tables() or []):
+                    if not table or len(table)<2:
+                        continue
+                    # Normalize every cell. House PDFs can contain line breaks inside Asset cells.
+                    rows=[["" if c is None else re.sub(r"\s+"," ",str(c)).strip() for c in row] for row in table]
+                    header=[c.lower() for c in rows[0]]
+                    def col(*needles):
+                        for i,h in enumerate(header):
+                            if any(n in h for n in needles):
+                                return i
+                        return None
+                    ia=col("asset"); it=col("transaction type"); idt=col("date")
+                    ind=col("notification date"); iam=col("amount")
+                    # "date" can accidentally resolve to Notification Date, so locate exact-ish Date separately.
+                    date_candidates=[i for i,h in enumerate(header) if h=="date" or h.endswith(" date")]
+                    if len(date_candidates)>=2:
+                        idt=date_candidates[0]; ind=date_candidates[1]
+                    if None in (ia,it,idt,ind,iam):
+                        continue
+                    for row in rows[1:]:
+                        if len(row)<=max(ia,it,idt,ind,iam):
+                            continue
+                        asset=row[ia]; tx=row[it]; td=row[idt]; nd=row[ind]; amount=row[iam]
+                        # Ignore description/subholding continuation rows.
+                        if not asset or not re.match(r"^(P|S|E)",tx.strip(),re.I):
+                            continue
+                        if not re.search(r"\d{1,2}/\d{1,2}/\d{4}",td):
+                            continue
+                        lo,hi=amount_range(amount)
+                        out.append((str(docid),name,"House",ticker_from_asset(asset),asset,tx,td,nd,
+                                    amount,lo,hi,url))
+    except Exception:
+        return []
     return out
 
 def refresh_house(year,limit=150):
-    idx=house_index(year).sort_values("FilingDate",ascending=False).head(limit);c=cx();n=0
+    idx=house_index(year).sort_values("FilingDate",ascending=False).head(limit)
+    c=cx();n=0;parsed=0
     for _,r in idx.iterrows():
-        for row in parse_ptr(r.DocID,f'{r["First"]} {r["Last"]}'.strip()):
+        rows=parse_ptr(r.DocID,f'{r["First"]} {r["Last"]}'.strip(),year)
+        parsed+=len(rows)
+        for row in rows:
             n+=c.execute("INSERT OR IGNORE INTO trades VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",row).rowcount
-    c.commit();c.close();return n
+    c.commit();c.close()
+    return n
 
 @st.cache_data(ttl=86400)
 def ticker_map():
@@ -186,7 +221,7 @@ with st.sidebar:
     page=st.radio("View",["Home","Discover","Watchlist","Alerts","Backtests","Politicians","Companies","Data Quality","Sources"])
     st.divider()
     if st.button("Refresh House"):
-        st.success(f"{refresh_house(datetime.now().year)} new rows.")
+        st.success(f"{refresh_house(datetime.now().year)} new transaction rows imported.")
     if st.button("Refresh SEC"):
         d0=load(False);st.success(f"{refresh_sec(d0.ticker.dropna().tolist() if len(d0) else [])} companies.")
     if st.button("Update backtests"):
