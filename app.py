@@ -7,7 +7,7 @@ import numpy as np
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Politician Trade Research V6",layout="wide",initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Politician Trade Research V6.5",layout="wide",initial_sidebar_state="collapsed")
 DB="politician_trades.db"; HOUSE="https://disclosures-clerk.house.gov"
 SEC="https://data.sec.gov"; SEC_WWW="https://www.sec.gov"
 UA={"User-Agent":"PoliticianTradeResearch personal research contact@example.com"}
@@ -175,51 +175,90 @@ def latest_fact(f,names,units=("USD","shares")):
                 vals.sort(key=lambda x:(x.get("filed",""),x.get("end","")));return float(vals[-1]["val"])
     return None
 
-def refresh_sec(tickers,batch_size=20,refresh_days=30,progress=None):
-    mp=ticker_map();c=cx()
+def sec_diagnostics(tickers,refresh_days=30):
+    raw=sorted(set(str(x).strip().upper() for x in tickers
+                   if pd.notna(x) and str(x).strip().upper() not in ("","NONE","NAN")))
+    mp=ticker_map()
+    compatible=[t for t in raw if t in mp]
+    unmapped=[t for t in raw if t not in mp]
+
+    c=cx()
     existing=pd.read_sql("SELECT ticker,sec_updated FROM fundamentals",c)
+    c.close()
     existing_map={}
     for _,r in existing.iterrows():
-        try: existing_map[str(r.ticker).upper()]=pd.Timestamp(r.sec_updated)
-        except: pass
-
-    wanted=[]
-    now=pd.Timestamp.now()
-    for x in sorted(set(str(x).upper() for x in tickers if pd.notna(x))):
-        if x not in mp: continue
-        old=existing_map.get(x)
-        if old is None or (now-old).days>=refresh_days:
-            wanted.append(x)
-
-    todo=wanted[:batch_size];ok=0;failed=0
-    for i,t in enumerate(todo,1):
-        cik=mp.get(t)
         try:
-            j=http(f"{SEC}/api/xbrl/companyfacts/CIK{cik}.json").json();f=j.get("facts",{})
-            row=(t,cik,j.get("entityName"),latest_fact(f,["Assets"]),latest_fact(f,["Liabilities"]),
+            existing_map[str(r.ticker).upper()]=pd.Timestamp(r.sec_updated)
+        except Exception:
+            pass
+
+    now=pd.Timestamp.now()
+    fresh=[]; opened=[]
+    for t in compatible:
+        old=existing_map.get(t)
+        if old is not None and (now-old).days < refresh_days:
+            fresh.append(t)
+        else:
+            opened.append(t)
+    return {"raw":raw,"compatible":compatible,"unmapped":unmapped,
+            "fresh":fresh,"open":opened}
+
+def refresh_sec(tickers,batch_size=20,refresh_days=30,progress=None):
+    diag=sec_diagnostics(tickers,refresh_days)
+    mp=ticker_map(); c=cx()
+    todo=diag["open"][:batch_size]
+    ok=0; errors=[]
+
+    for i,t in enumerate(todo,1):
+        cik=mp[t]
+        try:
+            j=http(f"{SEC}/api/xbrl/companyfacts/CIK{cik}.json").json()
+            f=j.get("facts",{})
+            row=(t,cik,j.get("entityName"),
+                 latest_fact(f,["Assets"]),
+                 latest_fact(f,["Liabilities"]),
                  latest_fact(f,["Revenues","RevenueFromContractWithCustomerExcludingAssessedTax","SalesRevenueNet"]),
-                 latest_fact(f,["NetIncomeLoss","ProfitLoss"]),latest_fact(f,["StockholdersEquity"]),
-                 latest_fact(f,["EntityCommonStockSharesOutstanding"],("shares",)),str(datetime.now()))
+                 latest_fact(f,["NetIncomeLoss","ProfitLoss"]),
+                 latest_fact(f,["StockholdersEquity"]),
+                 latest_fact(f,["EntityCommonStockSharesOutstanding"],("shares",)),
+                 str(datetime.now()))
             c.execute("INSERT OR REPLACE INTO fundamentals VALUES(?,?,?,?,?,?,?,?,?,?)",row)
             c.execute("""INSERT INTO enrichment_status(kind,item,status,attempts,last_error,updated)
                          VALUES('SEC',?,'ok',1,NULL,?)
                          ON CONFLICT(kind,item) DO UPDATE SET status='ok',
                          attempts=enrichment_status.attempts+1,last_error=NULL,updated=excluded.updated""",
                       (t,str(datetime.now())))
-            c.commit();ok+=1
+            c.commit(); ok+=1
         except Exception as e:
+            msg=f"{type(e).__name__}: {str(e)}"[:500]
+            errors.append((t,msg))
             c.execute("""INSERT INTO enrichment_status(kind,item,status,attempts,last_error,updated)
                          VALUES('SEC',?,'error',1,?,?)
                          ON CONFLICT(kind,item) DO UPDATE SET status='error',
                          attempts=enrichment_status.attempts+1,last_error=excluded.last_error,updated=excluded.updated""",
-                      (t,str(e)[:300],str(datetime.now())))
-            c.commit();failed+=1
-        if progress: progress.progress(i/max(1,len(todo)),text=f"SEC {i}/{len(todo)}: {t}")
-        time.sleep(.12)
+                      (t,msg,str(datetime.now())))
+            c.commit()
 
-    remaining=max(0,len(wanted)-len(todo))
-    c.close();st.cache_data.clear()
-    return {"processed":len(todo),"ok":ok,"failed":failed,"remaining":remaining,"fresh":len(set(tickers))-len(wanted)}
+        if progress:
+            progress.progress(i/max(1,len(todo)),text=f"SEC {i}/{len(todo)}: {t}")
+        time.sleep(.15)
+
+    c.close()
+    st.cache_data.clear()
+    after=sec_diagnostics(tickers,refresh_days)
+
+    return {
+        "unique_tickers":len(diag["raw"]),
+        "sec_compatible":len(diag["compatible"]),
+        "already_fresh_before":len(diag["fresh"]),
+        "open_before":len(diag["open"]),
+        "processed":len(todo),
+        "saved":ok,
+        "failed":len(errors),
+        "remaining":len(after["open"]),
+        "unmapped":diag["unmapped"],
+        "errors":errors
+    }
 
 @st.cache_data(ttl=21600)
 def prices(ticker,start,end):
@@ -315,7 +354,7 @@ def cluster_counts(x):
         out.append(w.politician.nunique())
     return out
 
-st.title("Politician Trade Research V6")
+st.title("Politician Trade Research V6.5")
 st.caption("Mobile-ready research dashboard • data quality • watchlist • alert rules • backtests")
 
 with st.sidebar:
@@ -333,11 +372,31 @@ with st.sidebar:
         if result["empty_filings"]:
             st.caption(f'{result["empty_filings"]} filings returned no parseable transaction table and remain a data-quality check.')
     if st.button("Refresh SEC (next batch)"):
-        d0=load(False);bar=st.progress(0,text="Preparing SEC batch…")
-        r=refresh_sec(d0.ticker.dropna().tolist() if len(d0) else [],batch_size=20,progress=bar)
+        d0=load(False)
+        ticker_list=d0.ticker.dropna().tolist() if len(d0) else []
+        bar=st.progress(0,text="Preparing SEC batch…")
+        r=refresh_sec(ticker_list,batch_size=20,progress=bar)
         bar.empty()
-        st.success(f'{r["ok"]} SEC companies saved • {r["failed"]} failed • {r["remaining"]} remaining')
-        if r["remaining"]>0: st.caption("Press again later to continue with the next batch. Completed companies are not restarted.")
+
+        st.success(f'{r["saved"]} saved • {r["failed"]} failed • {r["remaining"]} still open')
+        st.caption(
+            f'{r["unique_tickers"]} unique parsed tickers • '
+            f'{r["sec_compatible"]} SEC-mapped • '
+            f'{r["already_fresh_before"]} already fresh before batch • '
+            f'{r["open_before"]} open before batch'
+        )
+
+        if r["unmapped"]:
+            with st.expander(f'Unmapped tickers ({len(r["unmapped"])})'):
+                st.write(", ".join(r["unmapped"][:100]))
+
+        if r["errors"]:
+            with st.expander(f'SEC errors ({len(r["errors"])})',expanded=True):
+                for ticker,msg in r["errors"]:
+                    st.error(f"{ticker}: {msg}")
+
+        if r["remaining"]>0:
+            st.caption("Press again later to continue. Successfully saved companies are skipped.")
     if st.button("Update backtests (next batch)"):
         bar=st.progress(0,text="Preparing backtest batch…");r=run_backtests(25,progress=bar);bar.empty()
         st.success(f'{r["saved"]} backtests saved • {r["failed"]} unavailable • {r["remaining"]} remaining')
