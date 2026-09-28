@@ -7,7 +7,7 @@ import numpy as np
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Politician Trade Research V6.6.6",layout="wide",initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Politician Trade Research V6.7.7.6",layout="wide",initial_sidebar_state="collapsed")
 DB="politician_trades.db"; HOUSE="https://disclosures-clerk.house.gov"
 SEC="https://data.sec.gov"; SEC_WWW="https://www.sec.gov"
 UA={"User-Agent":"PoliticianTradeResearch personal research contact@example.com"}
@@ -233,7 +233,9 @@ def sec_diagnostics(tickers,refresh_days=30):
         if original in unavailable or candidate in unavailable:
             unavailable_raw.append(original)
             continue
-        old=existing_map.get(original) or existing_map.get(candidate)
+        old=existing_map.get(original)
+        if old is None:
+            old=existing_map.get(candidate)
         if old is not None and (now-old).days < refresh_days:
             fresh.append(original)
         else:
@@ -307,8 +309,21 @@ def refresh_sec(tickers,batch_size=20,refresh_days=30,progress=None):
             progress.progress(i/max(1,len(todo)),text=f"SEC {i}/{len(todo)}: {original}")
         time.sleep(.15)
 
-    c.close(); st.cache_data.clear()
+    c.close()
+    st.cache_data.clear()
     after=sec_diagnostics(tickers,refresh_days)
+
+    # Defensive terminal-state reconciliation: anything marked unavailable in SQLite
+    # must never remain in the open count, even if a cached upstream ticker map changes.
+    c2=cx()
+    terminal_rows=c2.execute(
+        "SELECT item FROM enrichment_status WHERE kind='SEC' AND status='unavailable'"
+    ).fetchall()
+    c2.close()
+    terminal={str(r[0]).upper() for r in terminal_rows}
+    after["open"]=[t for t in after["open"] if str(t).upper() not in terminal]
+    after["unavailable"]=sorted(set(after["unavailable"]) | terminal)
+
     return {
         "unique_tickers":len(diag["raw"]),
         "sec_compatible":len(diag["compatible"]),
@@ -420,7 +435,7 @@ def cluster_counts(x):
         out.append(w.politician.nunique())
     return out
 
-st.title("Politician Trade Research V6.6.6")
+st.title("Politician Trade Research V6.7.7.6")
 st.caption("Mobile-ready research dashboard • data quality • watchlist • alert rules • backtests")
 
 with st.sidebar:
