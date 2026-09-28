@@ -7,7 +7,7 @@ import numpy as np
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Politician Trade Research V6.9.8.7.6",layout="wide",initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Politician Trade Research V6.10.8.7.6",layout="wide",initial_sidebar_state="collapsed")
 DB="politician_trades.db"; HOUSE="https://disclosures-clerk.house.gov"
 SEC="https://data.sec.gov"; SEC_WWW="https://www.sec.gov"
 UA={"User-Agent":"PoliticianTradeResearch personal research contact@example.com"}
@@ -468,11 +468,11 @@ def cluster_counts(x):
         out.append(w.politician.nunique())
     return out
 
-st.title("Politician Trade Research V6.9.8.7.6")
+st.title("Politician Trade Research V6.10.8.7.6")
 st.caption("Mobile-ready research dashboard • data quality • watchlist • alert rules • backtests")
 
 with st.sidebar:
-    page=st.radio("View",["Home","Discover","Watchlist","Alerts","Backtests","Politicians","Companies","Data Quality","Sources"])
+    page=st.radio("View",["Home","Discover","Watchlist","Alerts","Backtests","Analytics","Politicians","Companies","Data Quality","Sources"])
     st.divider()
     if st.button("Refresh House"):
         with st.spinner("Checking official House filings…"):
@@ -669,6 +669,128 @@ elif page=="Backtests":
 
 These are historical, descriptive results and do not establish that a disclosure caused the later price movement.
 """)
+
+elif page=="Analytics":
+    st.subheader("Analytics")
+    st.caption(
+        "Descriptive analysis of publicly disclosed House transactions. Returns are historical results after "
+        "public notification; disclosed dollar amounts are ranges, not exact investment amounts."
+    )
+    if len(d):
+        buys=d[d.transaction.astype(str).str.upper().str.startswith("P")].copy()
+        buys=buys.dropna(subset=["politician"])
+
+        tab1,tab2,tab3,tab4,tab5=st.tabs([
+            "Transactions","Disclosed volume","By politician","Largest purchases","Reporting lag"
+        ])
+
+        with tab1:
+            st.markdown("### Historical transaction outcomes")
+            horizon=st.selectbox("Return horizon",[30,90,180],index=1,key="analytics_h")
+            metric=st.selectbox("Sort by",["Stock return","Excess vs SPY"],key="analytics_metric")
+            rc=f"r{horizon}";bc=f"b{horizon}";ec=f"excess{horizon}"
+            q=buys.dropna(subset=[rc]).copy()
+            sortcol=rc if metric=="Stock return" else ec
+            q=q.sort_values(sortcol,ascending=False)
+            cols=[c for c in ["politician","ticker","asset","trade_date","notification_date","lag_days",
+                               "amount_low","amount_high","est_amount",rc,bc,ec] if c in q.columns]
+            q=q[cols].rename(columns={
+                "politician":"Politician","ticker":"Ticker","asset":"Asset","trade_date":"Trade date",
+                "notification_date":"Public notification","lag_days":"Reporting lag (days)",
+                "amount_low":"Disclosed min","amount_high":"Disclosed max","est_amount":"Estimated midpoint",
+                rc:f"Stock {horizon}d",bc:f"SPY {horizon}d",ec:f"Vs SPY {horizon}d"
+            })
+            for c in [f"Stock {horizon}d",f"SPY {horizon}d",f"Vs SPY {horizon}d"]:
+                if c in q:q[c]=q[c].apply(lambda v:"—" if pd.isna(v) else f"{v:.2%}")
+            st.dataframe(q,use_container_width=True,hide_index=True)
+            st.caption(f"Completed observations for {horizon} days: {len(q)}. Sort order is descriptive, not a forecast.")
+
+        with tab2:
+            st.markdown("### Disclosed purchase volume by politician")
+            v=buys.dropna(subset=["amount_low","amount_high"]).copy()
+            if len(v):
+                g=v.groupby("politician",as_index=False).agg(
+                    purchases=("ticker","size"),
+                    disclosed_min=("amount_low","sum"),
+                    disclosed_max=("amount_high","sum"),
+                    estimated_midpoint=("est_amount","sum")
+                ).sort_values("estimated_midpoint",ascending=False)
+                g=g.rename(columns={
+                    "politician":"Politician","purchases":"Purchases",
+                    "disclosed_min":"Sum of disclosed minima",
+                    "disclosed_max":"Sum of disclosed maxima",
+                    "estimated_midpoint":"Estimated midpoint total"
+                })
+                st.dataframe(g,use_container_width=True,hide_index=True,
+                    column_config={
+                        "Sum of disclosed minima":st.column_config.NumberColumn(format="$%.0f"),
+                        "Sum of disclosed maxima":st.column_config.NumberColumn(format="$%.0f"),
+                        "Estimated midpoint total":st.column_config.NumberColumn(format="$%.0f")
+                    })
+                st.info("The midpoint is only an estimate derived from each disclosed amount range. It is not the politician's exact invested amount.")
+            else: st.info("No disclosed amount ranges available.")
+
+        with tab3:
+            st.markdown("### Historical results by politician")
+            h2=st.selectbox("Evaluation horizon",[30,90,180],index=1,key="analytics_pol_h")
+            r=f"r{h2}";e=f"excess{h2}"
+            z=buys.dropna(subset=[r,e]).copy()
+            if len(z):
+                rows=[]
+                for name,gp in z.groupby("politician"):
+                    rows.append({
+                        "Politician":name,
+                        "Completed N":len(gp),
+                        f"Median stock {h2}d":gp[r].median(),
+                        f"Median vs SPY {h2}d":gp[e].median(),
+                        "Positive cases":(gp[r]>0).mean(),
+                        "Cases above SPY":(gp[e]>0).mean()
+                    })
+                p=pd.DataFrame(rows).sort_values(["Completed N","Politician"],ascending=[False,True])
+                for c in [f"Median stock {h2}d",f"Median vs SPY {h2}d","Positive cases","Cases above SPY"]:
+                    p[c]=p[c].apply(lambda v:f"{v:.1%}")
+                st.dataframe(p,use_container_width=True,hide_index=True)
+                st.caption("Completed N is shown so results from a small number of disclosures are not confused with larger samples.")
+            else: st.info("No completed observations for this horizon.")
+
+        with tab4:
+            st.markdown("### Largest disclosed individual purchases")
+            q=buys.dropna(subset=["amount_low","amount_high"]).copy()
+            if len(q):
+                q=q.sort_values(["est_amount","notification_date"],ascending=[False,False])
+                cols=[c for c in ["politician","ticker","asset","trade_date","notification_date",
+                                   "amount_low","amount_high","est_amount","r30","r90","r180"] if c in q.columns]
+                q=q[cols].rename(columns={
+                    "politician":"Politician","ticker":"Ticker","asset":"Asset","trade_date":"Trade date",
+                    "notification_date":"Public notification","amount_low":"Disclosed min",
+                    "amount_high":"Disclosed max","est_amount":"Estimated midpoint",
+                    "r30":"Stock 30d","r90":"Stock 90d","r180":"Stock 180d"
+                })
+                for c in ["Stock 30d","Stock 90d","Stock 180d"]:
+                    if c in q:q[c]=q[c].apply(lambda v:"Pending" if pd.isna(v) else f"{v:.2%}")
+                st.dataframe(q,use_container_width=True,hide_index=True,
+                    column_config={
+                        "Disclosed min":st.column_config.NumberColumn(format="$%.0f"),
+                        "Disclosed max":st.column_config.NumberColumn(format="$%.0f"),
+                        "Estimated midpoint":st.column_config.NumberColumn(format="$%.0f")
+                    })
+                st.caption("Ordered by the estimated midpoint of the disclosed range; exact purchase amounts are generally not disclosed.")
+
+        with tab5:
+            st.markdown("### Reporting lag")
+            q=buys.dropna(subset=["trade_date","notification_date","lag_days"]).copy()
+            if len(q):
+                c1,c2,c3=st.columns(3)
+                c1.metric("Median lag",f"{q.lag_days.median():.0f} days")
+                c2.metric("Average lag",f"{q.lag_days.mean():.1f} days")
+                c3.metric("Observed purchases",len(q))
+                cols=[c for c in ["politician","ticker","asset","trade_date","notification_date","lag_days"] if c in q.columns]
+                q=q.sort_values("lag_days",ascending=False)[cols].rename(columns={
+                    "politician":"Politician","ticker":"Ticker","asset":"Asset","trade_date":"Trade date",
+                    "notification_date":"Public notification","lag_days":"Reporting lag (days)"
+                })
+                st.dataframe(q,use_container_width=True,hide_index=True)
+                st.caption("Reporting lag = public notification date minus reported transaction date.")
 
 elif page=="Politicians":
     if len(d):
