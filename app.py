@@ -28,6 +28,9 @@ def cx():
       net_income REAL,equity REAL,shares REAL,sec_updated TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS import_keys(
       tx_key TEXT PRIMARY KEY, filing_id TEXT, created TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS enrichment_status(
+      kind TEXT, item TEXT, status TEXT, attempts INTEGER DEFAULT 0,
+      last_error TEXT, updated TEXT, PRIMARY KEY(kind,item))""")
     c.execute("""CREATE TABLE IF NOT EXISTS watchlist(
       kind TEXT,value TEXT,created TEXT,UNIQUE(kind,value))""")
     c.execute("""CREATE TABLE IF NOT EXISTS alert_rules(
@@ -172,20 +175,51 @@ def latest_fact(f,names,units=("USD","shares")):
                 vals.sort(key=lambda x:(x.get("filed",""),x.get("end","")));return float(vals[-1]["val"])
     return None
 
-def refresh_sec(tickers):
-    mp=ticker_map();c=cx();n=0
-    for t in sorted(set(str(x).upper() for x in tickers if pd.notna(x))):
+def refresh_sec(tickers,batch_size=20,refresh_days=30,progress=None):
+    mp=ticker_map();c=cx()
+    existing=pd.read_sql("SELECT ticker,sec_updated FROM fundamentals",c)
+    existing_map={}
+    for _,r in existing.iterrows():
+        try: existing_map[str(r.ticker).upper()]=pd.Timestamp(r.sec_updated)
+        except: pass
+
+    wanted=[]
+    now=pd.Timestamp.now()
+    for x in sorted(set(str(x).upper() for x in tickers if pd.notna(x))):
+        if x not in mp: continue
+        old=existing_map.get(x)
+        if old is None or (now-old).days>=refresh_days:
+            wanted.append(x)
+
+    todo=wanted[:batch_size];ok=0;failed=0
+    for i,t in enumerate(todo,1):
         cik=mp.get(t)
-        if not cik:continue
         try:
             j=http(f"{SEC}/api/xbrl/companyfacts/CIK{cik}.json").json();f=j.get("facts",{})
             row=(t,cik,j.get("entityName"),latest_fact(f,["Assets"]),latest_fact(f,["Liabilities"]),
                  latest_fact(f,["Revenues","RevenueFromContractWithCustomerExcludingAssessedTax","SalesRevenueNet"]),
                  latest_fact(f,["NetIncomeLoss","ProfitLoss"]),latest_fact(f,["StockholdersEquity"]),
                  latest_fact(f,["EntityCommonStockSharesOutstanding"],("shares",)),str(datetime.now()))
-            c.execute("INSERT OR REPLACE INTO fundamentals VALUES(?,?,?,?,?,?,?,?,?,?)",row);n+=1;time.sleep(.12)
-        except:pass
-    c.commit();c.close();return n
+            c.execute("INSERT OR REPLACE INTO fundamentals VALUES(?,?,?,?,?,?,?,?,?,?)",row)
+            c.execute("""INSERT INTO enrichment_status(kind,item,status,attempts,last_error,updated)
+                         VALUES('SEC',?,'ok',1,NULL,?)
+                         ON CONFLICT(kind,item) DO UPDATE SET status='ok',
+                         attempts=enrichment_status.attempts+1,last_error=NULL,updated=excluded.updated""",
+                      (t,str(datetime.now())))
+            c.commit();ok+=1
+        except Exception as e:
+            c.execute("""INSERT INTO enrichment_status(kind,item,status,attempts,last_error,updated)
+                         VALUES('SEC',?,'error',1,?,?)
+                         ON CONFLICT(kind,item) DO UPDATE SET status='error',
+                         attempts=enrichment_status.attempts+1,last_error=excluded.last_error,updated=excluded.updated""",
+                      (t,str(e)[:300],str(datetime.now())))
+            c.commit();failed+=1
+        if progress: progress.progress(i/max(1,len(todo)),text=f"SEC {i}/{len(todo)}: {t}")
+        time.sleep(.12)
+
+    remaining=max(0,len(wanted)-len(todo))
+    c.close();st.cache_data.clear()
+    return {"processed":len(todo),"ok":ok,"failed":failed,"remaining":remaining,"fresh":len(set(tickers))-len(wanted)}
 
 @st.cache_data(ttl=21600)
 def prices(ticker,start,end):
@@ -211,17 +245,31 @@ def backtest(ticker,report,benchmark="SPY"):
         z[f"r{h}"]=sr;z[f"b{h}"]=br;z[f"excess{h}"]=None if sr is None or br is None else sr-br
     return z
 
-def run_backtests(maxrows=300):
-    d=load(False);d=d[d.transaction.astype(str).str.upper().str.startswith("P")].dropna(subset=["ticker","notification_date"])
-    c=cx();n=0
-    for _,r in d.sort_values("notification_date",ascending=False).head(maxrows).iterrows():
-        z=backtest(r.ticker,r.notification_date)
-        if not z:continue
-        c.execute("INSERT OR REPLACE INTO backtests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-          (r.filing_id,r.chamber,r.ticker,str(r.notification_date.date()),z["entry_date"],z["entry_price"],
-           z["r30"],z["r90"],z["r180"],z["b30"],z["b90"],z["b180"],z["excess30"],z["excess90"],z["excess180"],str(datetime.now())))
-        n+=1
-    c.commit();c.close();st.cache_data.clear();return n
+def run_backtests(maxrows=25,progress=None):
+    d=load(False)
+    d=d[d.transaction.astype(str).str.upper().str.startswith("P")].dropna(subset=["ticker","notification_date"])
+    c=cx()
+    done=pd.read_sql("SELECT filing_id,chamber,ticker,notification_date FROM backtests",c)
+    keys=set()
+    for _,r in done.iterrows():
+        keys.add((str(r.filing_id),str(r.chamber),str(r.ticker),str(pd.Timestamp(r.notification_date).date())))
+    candidates=[]
+    for _,r in d.sort_values("notification_date",ascending=False).iterrows():
+        k=(str(r.filing_id),str(r.chamber),str(r.ticker),str(pd.Timestamp(r.notification_date).date()))
+        if k not in keys:candidates.append(r)
+    todo=candidates[:maxrows];n=0;failed=0
+    for i,r in enumerate(todo,1):
+        try:z=backtest(r.ticker,r.notification_date)
+        except:z=None
+        if z:
+            c.execute("INSERT OR REPLACE INTO backtests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              (r.filing_id,r.chamber,r.ticker,str(r.notification_date.date()),z["entry_date"],z["entry_price"],
+               z["r30"],z["r90"],z["r180"],z["b30"],z["b90"],z["b180"],z["excess30"],z["excess90"],z["excess180"],str(datetime.now())))
+            c.commit();n+=1
+        else: failed+=1
+        if progress:progress.progress(i/max(1,len(todo)),text=f"Backtest {i}/{len(todo)}: {r.ticker}")
+    c.close();st.cache_data.clear()
+    return {"processed":len(todo),"saved":n,"failed":failed,"remaining":max(0,len(candidates)-len(todo))}
 
 def load(with_f=True):
     c=cx();t=pd.read_sql("SELECT * FROM trades",c);b=pd.read_sql("SELECT * FROM backtests",c);f=pd.read_sql("SELECT * FROM fundamentals",c);c.close()
@@ -284,10 +332,16 @@ with st.sidebar:
         )
         if result["empty_filings"]:
             st.caption(f'{result["empty_filings"]} filings returned no parseable transaction table and remain a data-quality check.')
-    if st.button("Refresh SEC"):
-        d0=load(False);st.success(f"{refresh_sec(d0.ticker.dropna().tolist() if len(d0) else [])} companies.")
-    if st.button("Update backtests"):
-        st.success(f"{run_backtests()} purchases analyzed.")
+    if st.button("Refresh SEC (next batch)"):
+        d0=load(False);bar=st.progress(0,text="Preparing SEC batch…")
+        r=refresh_sec(d0.ticker.dropna().tolist() if len(d0) else [],batch_size=20,progress=bar)
+        bar.empty()
+        st.success(f'{r["ok"]} SEC companies saved • {r["failed"]} failed • {r["remaining"]} remaining')
+        if r["remaining"]>0: st.caption("Press again later to continue with the next batch. Completed companies are not restarted.")
+    if st.button("Update backtests (next batch)"):
+        bar=st.progress(0,text="Preparing backtest batch…");r=run_backtests(25,progress=bar);bar.empty()
+        st.success(f'{r["saved"]} backtests saved • {r["failed"]} unavailable • {r["remaining"]} remaining')
+        if r["remaining"]>0: st.caption("Press again later to continue. Existing backtests are skipped.")
 
 d=load()
 
