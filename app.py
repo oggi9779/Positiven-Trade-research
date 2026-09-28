@@ -7,7 +7,7 @@ import numpy as np
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Politician Trade Research V6.8.8.7.6",layout="wide",initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Politician Trade Research V6.9.8.7.6",layout="wide",initial_sidebar_state="collapsed")
 DB="politician_trades.db"; HOUSE="https://disclosures-clerk.house.gov"
 SEC="https://data.sec.gov"; SEC_WWW="https://www.sec.gov"
 UA={"User-Agent":"PoliticianTradeResearch personal research contact@example.com"}
@@ -468,7 +468,7 @@ def cluster_counts(x):
         out.append(w.politician.nunique())
     return out
 
-st.title("Politician Trade Research V6.8.8.7.6")
+st.title("Politician Trade Research V6.9.8.7.6")
 st.caption("Mobile-ready research dashboard • data quality • watchlist • alert rules • backtests")
 
 with st.sidebar:
@@ -587,23 +587,88 @@ elif page=="Alerts":
 
 elif page=="Backtests":
     if len(d):
-        x=d[d.transaction.astype(str).str.upper().str.startswith("P")]
-        h=st.selectbox("Holding period",[30,90,180],index=1);who=st.selectbox("Politician",["All"]+sorted(x.politician.unique().tolist()))
+        x=d[d.transaction.astype(str).str.upper().str.startswith("P")].copy()
+
+        st.subheader("Historical performance after public disclosure")
+        st.caption(
+            "Signal = public notification date. The simulated entry is the first common trading day after "
+            "the disclosure. Returns use adjusted historical closing prices. SPY is the market benchmark."
+        )
+
+        h=st.selectbox("Holding period",[30,90,180],index=1,
+                       format_func=lambda v:f"{v} days after simulated entry")
+        who=st.selectbox("Politician",["All"]+sorted(x.politician.dropna().unique().tolist()))
         if who!="All":x=x[x.politician==who]
-        rc=f"r{h}";ec=f"excess{h}";y=x.dropna(subset=[rc])
-        c1,c2,c3,c4=st.columns(4);c1.metric("N",len(y))
-        c2.metric("Positive",f"{(y[rc]>0).mean():.1%}" if len(y) else "—")
-        c3.metric("Beat SPY",f"{(y[ec]>0).mean():.1%}" if len(y) else "—")
-        c4.metric("Median excess",f"{y[ec].median():.1%}" if len(y) else "—")
-        st.dataframe(y.sort_values("notification_date",ascending=False),use_container_width=True,hide_index=True)
+
+        rc=f"r{h}";bc=f"b{h}";ec=f"excess{h}"
+        y=x.dropna(subset=[rc]).copy()
+        pending=max(0,len(x)-len(y))
+
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("Completed (N)",len(y),help="Number of transactions with enough elapsed time and usable price data for this horizon.")
+        c2.metric("Positive return",f"{(y[rc]>0).mean():.1%}" if len(y) else "—",
+                  help="Share of completed cases where the stock return was above 0%.")
+        c3.metric("Outperformed SPY",f"{(y[ec]>0).mean():.1%}" if len(y) else "—",
+                  help="Share of completed cases where the stock return was higher than SPY over the same period.")
+        c4.metric("Median vs. SPY",f"{y[ec].median():.1%}" if len(y) else "—",
+                  help="Median stock return minus SPY return. Positive means above the benchmark; negative means below it.")
+
+        st.caption(f"Pending / not available for {h} days: {pending}")
+
+        show=y.sort_values("notification_date",ascending=False).copy()
+        rename={
+            "filing_id":"Filing ID","politician":"Politician","chamber":"Chamber","ticker":"Ticker",
+            "asset":"Asset","trade_date":"Trade date","notification_date":"Public notification",
+            "entry_date":"Simulated entry","entry_price":"Adjusted entry price",
+            rc:f"Stock return {h}d",bc:f"SPY return {h}d",ec:f"Excess vs SPY {h}d"
+        }
+        preferred=["filing_id","politician","chamber","ticker","asset","trade_date","notification_date",
+                   "entry_date","entry_price",rc,bc,ec]
+        cols=[c for c in preferred if c in show.columns]
+        table=show[cols].rename(columns=rename)
+        for c in [f"Stock return {h}d",f"SPY return {h}d",f"Excess vs SPY {h}d"]:
+            if c in table.columns:
+                table[c]=table[c].apply(lambda v:"—" if pd.isna(v) else f"{v:.2%}")
+        st.dataframe(
+            table,use_container_width=True,hide_index=True,
+            column_config={"Adjusted entry price":st.column_config.NumberColumn(format="$%.4f")}
+        )
+
         st.subheader("Validation sample")
-        st.caption("Public notification date is the signal date. Entry is the first common trading date after that date.")
-        cols=[c for c in ["politician","ticker","trade_date","notification_date","entry_date","entry_price",
-                          "r30","b30","excess30","r90","b90","excess90","r180","b180","excess180","source_url"] if c in y.columns]
-        sample=y.sort_values("notification_date",ascending=False)[cols].head(20).copy()
-        for c in ["r30","b30","excess30","r90","b90","excess90","r180","b180","excess180"]:
-            if c in sample:sample[c]=sample[c].map(lambda v: None if pd.isna(v) else f"{v:.2%}")
+        st.caption(
+            "Use this table to audit individual calculations. 'Pending' means the required horizon has not "
+            "yet produced a usable observation; it is not counted as a completed result."
+        )
+        audit_cols=[c for c in ["politician","ticker","trade_date","notification_date","entry_date","entry_price",
+                                "r30","b30","excess30","r90","b90","excess90","r180","b180","excess180"] if c in x.columns]
+        sample=x.sort_values("notification_date",ascending=False)[audit_cols].head(20).copy()
+        audit_rename={
+            "politician":"Politician","ticker":"Ticker","trade_date":"Trade date",
+            "notification_date":"Public notification","entry_date":"Simulated entry",
+            "entry_price":"Adjusted entry price",
+            "r30":"Stock 30d","b30":"SPY 30d","excess30":"Vs SPY 30d",
+            "r90":"Stock 90d","b90":"SPY 90d","excess90":"Vs SPY 90d",
+            "r180":"Stock 180d","b180":"SPY 180d","excess180":"Vs SPY 180d"
+        }
+        sample=sample.rename(columns=audit_rename)
+        for c in ["Stock 30d","SPY 30d","Vs SPY 30d","Stock 90d","SPY 90d","Vs SPY 90d",
+                  "Stock 180d","SPY 180d","Vs SPY 180d"]:
+            if c in sample.columns:
+                sample[c]=sample[c].apply(lambda v:"Pending" if pd.isna(v) else f"{v:.2%}")
         st.dataframe(sample,use_container_width=True,hide_index=True)
+
+        with st.expander("How to read these numbers"):
+            st.markdown("""
+**Trade date** = date of the politician's reported transaction.  
+**Public notification** = date the disclosure became public in our dataset.  
+**Simulated entry** = first common trading day after the public notification.  
+**Stock return** = historical stock performance after the simulated entry.  
+**SPY return** = performance of the SPDR S&P 500 ETF over the same horizon.  
+**Excess vs SPY** = stock return minus SPY return.  
+**Pending** = the horizon is not yet complete or a usable observation is not available.
+
+These are historical, descriptive results and do not establish that a disclosure caused the later price movement.
+""")
 
 elif page=="Politicians":
     if len(d):
