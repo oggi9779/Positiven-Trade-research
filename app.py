@@ -1,5 +1,5 @@
 
-import re, sqlite3, requests, time, io, hashlib
+import re, sqlite3, requests, time, io, hashlib, os, shutil
 import pdfplumber
 from datetime import datetime
 import pandas as pd
@@ -7,10 +7,11 @@ import numpy as np
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Politician Trade Research V6.10.8.7.6",layout="wide",initial_sidebar_state="collapsed")
-DB="politician_trades.db"; HOUSE="https://disclosures-clerk.house.gov"
+st.set_page_config(page_title="Politician Trade Research V7.0",layout="wide",initial_sidebar_state="collapsed")
+DB=os.getenv("POLITICIAN_DB_PATH","politician_trades.db"); HOUSE="https://disclosures-clerk.house.gov"
 SEC="https://data.sec.gov"; SEC_WWW="https://www.sec.gov"
-UA={"User-Agent":"PoliticianTradeResearch personal research contact@example.com"}
+SEC_CONTACT=os.getenv("SEC_CONTACT_EMAIL","contact@example.com")
+UA={"User-Agent":f"PoliticianTradeResearch personal research {SEC_CONTACT}"}
 
 def cx():
     c=sqlite3.connect(DB)
@@ -424,6 +425,42 @@ def run_backfill(batch_size=25,max_batches=8,progress=None):
         if after>=before:break
     return {"batches":batches,"saved":total_saved,"failed":total_unavailable,"remaining":len(backtest_queue())}
 
+def backup_database(target=None):
+    """Create a consistent SQLite snapshot after a successful refresh."""
+    target=target or os.getenv("POLITICIAN_DB_BACKUP","politician_trades_backup.db")
+    src=cx()
+    dst=sqlite3.connect(target)
+    with dst:
+        src.backup(dst)
+    dst.close();src.close()
+    return target
+
+def run_daily_pipeline(house_limit=150,sec_batch_size=20,sec_max_batches=20,backtest_batch_size=25,backtest_max_batches=20):
+    """Run the same incremental pipeline without UI button interaction."""
+    summary={"started":str(datetime.now())}
+    summary["house"]=refresh_house(datetime.now().year,limit=house_limit)
+
+    raw=load(False)
+    tickers=raw.ticker.dropna().astype(str).tolist() if len(raw) else []
+    sec_saved=sec_unavailable=sec_failed=0
+    sec_batches=0
+    sec_remaining=0
+    for _ in range(sec_max_batches):
+        r=refresh_sec(tickers,batch_size=sec_batch_size)
+        sec_batches+=1
+        sec_saved+=r["saved"];sec_unavailable+=len(r["unavailable_now"]);sec_failed+=r["failed"]
+        sec_remaining=r["remaining"]
+        if sec_remaining==0 or (r["processed"]==0 and r["failed"]==0):break
+        if r["failed"] and r["saved"]==0 and not r["unavailable_now"]:break
+    summary["sec"]={"batches":sec_batches,"saved":sec_saved,"unavailable":sec_unavailable,
+                    "failed":sec_failed,"remaining":sec_remaining}
+
+    bt=run_backfill(batch_size=backtest_batch_size,max_batches=backtest_max_batches)
+    summary["backtests"]=bt
+    summary["backup"]=backup_database()
+    summary["finished"]=str(datetime.now())
+    return summary
+
 def load(with_f=True):
     c=cx();t=pd.read_sql("SELECT * FROM trades",c);b=pd.read_sql("SELECT * FROM backtests",c);f=pd.read_sql("SELECT * FROM fundamentals",c);c.close()
     for z in ("trade_date","notification_date"):
@@ -468,362 +505,368 @@ def cluster_counts(x):
         out.append(w.politician.nunique())
     return out
 
-st.title("Politician Trade Research V6.10.8.7.6")
-st.caption("Mobile-ready research dashboard • data quality • watchlist • alert rules • backtests")
+if os.getenv("HEADLESS_REFRESH")=="1":
+    result=run_daily_pipeline()
+    print(result)
+else:
+    st.title("Politician Trade Research V7.0")
+    st.caption("Mobile-ready research dashboard • data quality • watchlist • alert rules • backtests")
 
-with st.sidebar:
-    page=st.radio("View",["Home","Discover","Watchlist","Alerts","Backtests","Analytics","Politicians","Companies","Data Quality","Sources"])
-    st.divider()
-    if st.button("Refresh House"):
-        with st.spinner("Checking official House filings…"):
-            result=refresh_house(datetime.now().year)
-        st.success(
-            f'{result["filings_checked"]} filings checked • '
-            f'{result["rows_detected"]} transactions detected • '
-            f'{result["inserted"]} new • '
-            f'{result["duplicates"]} already stored'
-        )
-        if result["empty_filings"]:
-            st.caption(f'{result["empty_filings"]} filings returned no parseable transaction table and remain a data-quality check.')
-    if st.button("Refresh SEC (next batch)"):
-        d0=load(False)
-        ticker_list=d0.ticker.dropna().tolist() if len(d0) else []
-        bar=st.progress(0,text="Preparing SEC batch…")
-        r=refresh_sec(ticker_list,batch_size=20,progress=bar)
-        bar.empty()
+    with st.sidebar:
+        page=st.radio("View",["Home","Discover","Watchlist","Alerts","Backtests","Analytics","Politicians","Companies","Data Quality","Sources"])
+        st.divider()
+        if st.button("Run full refresh now"):
+            with st.spinner("Running House → SEC → backtests…"):
+                r=run_daily_pipeline()
+            st.success(
+                f'Full refresh complete • House +{r["house"]["inserted"]} • '
+                f'SEC +{r["sec"]["saved"]} • Backtests +{r["backtests"]["saved"]}'
+            )
+            st.caption(f'Database snapshot: {r["backup"]}')
+        if st.button("Refresh House"):
+            with st.spinner("Checking official House filings…"):
+                result=refresh_house(datetime.now().year)
+            st.success(
+                f'{result["filings_checked"]} filings checked • '
+                f'{result["rows_detected"]} transactions detected • '
+                f'{result["inserted"]} new • '
+                f'{result["duplicates"]} already stored'
+            )
+            if result["empty_filings"]:
+                st.caption(f'{result["empty_filings"]} filings returned no parseable transaction table and remain a data-quality check.')
+        if st.button("Refresh SEC (next batch)"):
+            d0=load(False)
+            ticker_list=d0.ticker.dropna().tolist() if len(d0) else []
+            bar=st.progress(0,text="Preparing SEC batch…")
+            r=refresh_sec(ticker_list,batch_size=20,progress=bar)
+            bar.empty()
 
-        st.success(
-            f'{r["saved"]} saved • {len(r["unavailable_now"])} marked unavailable • '
-            f'{r["failed"]} retryable failed • {r["remaining"]} still open'
-        )
-        st.caption(
-            f'{r["unique_tickers"]} unique parsed tickers • '
-            f'{r["sec_compatible"]} SEC-mapped • '
-            f'{r["already_fresh_before"]} already fresh • '
-            f'{r["unavailable_before"]} already unavailable • '
-            f'{r["open_before"]} open before batch'
-        )
+            st.success(
+                f'{r["saved"]} saved • {len(r["unavailable_now"])} marked unavailable • '
+                f'{r["failed"]} retryable failed • {r["remaining"]} still open'
+            )
+            st.caption(
+                f'{r["unique_tickers"]} unique parsed tickers • '
+                f'{r["sec_compatible"]} SEC-mapped • '
+                f'{r["already_fresh_before"]} already fresh • '
+                f'{r["unavailable_before"]} already unavailable • '
+                f'{r["open_before"]} open before batch'
+            )
 
-        if r["unmapped_classification"]:
-            with st.expander(f'Unmapped tickers ({len(r["unmapped_classification"])})'):
-                for ticker,reason in r["unmapped_classification"]:
-                    st.write(f"**{ticker}** — {reason}")
+            if r["unmapped_classification"]:
+                with st.expander(f'Unmapped tickers ({len(r["unmapped_classification"])})'):
+                    for ticker,reason in r["unmapped_classification"]:
+                        st.write(f"**{ticker}** — {reason}")
 
-        if r["unavailable_total"]:
-            with st.expander(f'SEC fundamentals unavailable ({len(r["unavailable_total"])})'):
-                st.write(", ".join(r["unavailable_total"]))
+            if r["unavailable_total"]:
+                with st.expander(f'SEC fundamentals unavailable ({len(r["unavailable_total"])})'):
+                    st.write(", ".join(r["unavailable_total"]))
 
-        if r["errors"]:
-            with st.expander(f'Retryable SEC errors ({len(r["errors"])})',expanded=True):
-                for ticker,msg in r["errors"]:
-                    st.error(f"{ticker}: {msg}")
+            if r["errors"]:
+                with st.expander(f'Retryable SEC errors ({len(r["errors"])})',expanded=True):
+                    for ticker,msg in r["errors"]:
+                        st.error(f"{ticker}: {msg}")
 
-        if r["remaining"]>0:
-            st.caption("Press again later to continue. Saved and permanently unavailable companies are skipped.")
-    if st.button("Update backtests (next batch)"):
-        bar=st.progress(0,text="Preparing backtest batch…");r=run_backtests(25,progress=bar);bar.empty()
-        st.success(f'{r["saved"]} backtests saved • {r["failed"]} unavailable • {r["remaining"]} remaining')
-        if r["remaining"]>0: st.caption("Press again later to continue. Existing backtests are skipped.")
-    if st.button("Backfill remaining backtests"):
-        bar=st.progress(0,text="Starting controlled backfill…")
-        r=run_backfill(batch_size=25,max_batches=8,progress=bar);bar.empty()
-        st.success(f'{r["saved"]} saved • {r["failed"]} unavailable • {r["remaining"]} remaining • {r["batches"]} batches')
-        if r["remaining"]>0:st.caption("Run again later to continue. Completed and unavailable cases are skipped.")
+            if r["remaining"]>0:
+                st.caption("Press again later to continue. Saved and permanently unavailable companies are skipped.")
+        if st.button("Update backtests (next batch)"):
+            bar=st.progress(0,text="Preparing backtest batch…");r=run_backtests(25,progress=bar);bar.empty()
+            st.success(f'{r["saved"]} backtests saved • {r["failed"]} unavailable • {r["remaining"]} remaining')
+            if r["remaining"]>0: st.caption("Press again later to continue. Existing backtests are skipped.")
+        if st.button("Backfill remaining backtests"):
+            bar=st.progress(0,text="Starting controlled backfill…")
+            r=run_backfill(batch_size=25,max_batches=8,progress=bar);bar.empty()
+            st.success(f'{r["saved"]} saved • {r["failed"]} unavailable • {r["remaining"]} remaining • {r["batches"]} batches')
+            if r["remaining"]>0:st.caption("Run again later to continue. Completed and unavailable cases are skipped.")
 
-d=load()
+    d=load()
 
-if page=="Home":
-    if d.empty:st.info("Open the sidebar and refresh House data first.")
-    else:
-        buys=d[d.transaction.astype(str).str.upper().str.startswith("P")].copy()
-        c1,c2,c3=st.columns(3);c1.metric("Disclosures",len(d));c2.metric("Purchases",len(buys));c3.metric("Politicians",d.politician.nunique())
-        st.subheader("Newest public purchase disclosures")
-        cols=[x for x in ["notification_date","politician","ticker","company","amount","lag_days","source_url"] if x in buys]
-        st.dataframe(buys[cols].sort_values("notification_date",ascending=False).head(15),
-          column_config={"source_url":st.column_config.LinkColumn("Filing")},use_container_width=True,hide_index=True)
+    if page=="Home":
+        if d.empty:st.info("Open the sidebar and refresh House data first.")
+        else:
+            buys=d[d.transaction.astype(str).str.upper().str.startswith("P")].copy()
+            c1,c2,c3=st.columns(3);c1.metric("Disclosures",len(d));c2.metric("Purchases",len(buys));c3.metric("Politicians",d.politician.nunique())
+            st.subheader("Newest public purchase disclosures")
+            cols=[x for x in ["notification_date","politician","ticker","company","amount","lag_days","source_url"] if x in buys]
+            st.dataframe(buys[cols].sort_values("notification_date",ascending=False).head(15),
+              column_config={"source_url":st.column_config.LinkColumn("Filing")},use_container_width=True,hide_index=True)
 
-elif page=="Discover":
-    if len(d):
-        x=d[d.transaction.astype(str).str.upper().str.startswith("P")].dropna(subset=["ticker"]).copy()
-        x["cluster30"]=cluster_counts(x)
-        qs=x.apply(quality,axis=1);x["quality"]=[a for a,b in qs];x["quality_note"]=[b for a,b in qs]
-        minq=st.slider("Minimum data quality",0,100,70)
-        x=x[x.quality>=minq]
-        st.dataframe(x.sort_values(["cluster30","notification_date"],ascending=False),use_container_width=True,hide_index=True)
-        t=st.selectbox("Add ticker to watchlist",[""]+sorted(x.ticker.unique().tolist()))
-        if t and st.button("Watch ticker"):add_watch("ticker",t);st.success(f"{t} added.")
-
-elif page=="Watchlist":
-    w=watch()
-    if w.empty:st.info("No watchlist items yet.")
-    else:
-        st.dataframe(w,use_container_width=True,hide_index=True)
+    elif page=="Discover":
         if len(d):
-            tickers=w[w.kind=="ticker"].value.tolist()
-            x=d[d.ticker.isin(tickers)]
-            st.subheader("Matching disclosures")
-            st.dataframe(x.sort_values("notification_date",ascending=False),use_container_width=True,hide_index=True)
+            x=d[d.transaction.astype(str).str.upper().str.startswith("P")].dropna(subset=["ticker"]).copy()
+            x["cluster30"]=cluster_counts(x)
+            qs=x.apply(quality,axis=1);x["quality"]=[a for a,b in qs];x["quality_note"]=[b for a,b in qs]
+            minq=st.slider("Minimum data quality",0,100,70)
+            x=x[x.quality>=minq]
+            st.dataframe(x.sort_values(["cluster30","notification_date"],ascending=False),use_container_width=True,hide_index=True)
+            t=st.selectbox("Add ticker to watchlist",[""]+sorted(x.ticker.unique().tolist()))
+            if t and st.button("Watch ticker"):add_watch("ticker",t);st.success(f"{t} added.")
 
-elif page=="Alerts":
-    st.subheader("Saved research rules")
-    with st.form("rule"):
-        name=st.text_input("Rule name","Large / fast / clustered purchase")
-        amt=st.number_input("Minimum estimated amount",0,10000000,100000,10000)
-        lag=st.number_input("Maximum reporting lag (days)",0,90,20)
-        clu=st.number_input("Minimum politicians in 30-day ticker cluster",1,20,2)
-        rev=st.number_input("Maximum company revenue ($, 0 = ignore)",0,100000000000,2000000000,100000000)
-        if st.form_submit_button("Save rule"):add_rule(name,amt,lag,clu,rev);st.success("Rule saved.")
-    r=rules();st.dataframe(r,use_container_width=True,hide_index=True)
-    if len(d) and len(r):
-        x=d[d.transaction.astype(str).str.upper().str.startswith("P")].dropna(subset=["ticker"]).copy();x["cluster30"]=cluster_counts(x)
-        matches=[]
-        for _,rule in r[r.enabled==1].iterrows():
-            q=x[(x.est_amount.fillna(0)>=rule.min_amount)&(x.lag_days.fillna(999)<=rule.max_lag)&(x.cluster30>=rule.cluster_min)]
-            if rule.small_company_revenue>0:q=q[q.revenue.fillna(np.inf)<=rule.small_company_revenue]
-            if len(q):
-                z=q.copy();z["matched_rule"]=rule["name"];matches.append(z)
-        if matches:
-            st.subheader("Current matches");st.dataframe(pd.concat(matches).sort_values("notification_date",ascending=False),use_container_width=True,hide_index=True)
+    elif page=="Watchlist":
+        w=watch()
+        if w.empty:st.info("No watchlist items yet.")
+        else:
+            st.dataframe(w,use_container_width=True,hide_index=True)
+            if len(d):
+                tickers=w[w.kind=="ticker"].value.tolist()
+                x=d[d.ticker.isin(tickers)]
+                st.subheader("Matching disclosures")
+                st.dataframe(x.sort_values("notification_date",ascending=False),use_container_width=True,hide_index=True)
 
-elif page=="Backtests":
-    if len(d):
-        x=d[d.transaction.astype(str).str.upper().str.startswith("P")].copy()
+    elif page=="Alerts":
+        st.subheader("Saved research rules")
+        with st.form("rule"):
+            name=st.text_input("Rule name","Large / fast / clustered purchase")
+            amt=st.number_input("Minimum estimated amount",0,10000000,100000,10000)
+            lag=st.number_input("Maximum reporting lag (days)",0,90,20)
+            clu=st.number_input("Minimum politicians in 30-day ticker cluster",1,20,2)
+            rev=st.number_input("Maximum company revenue ($, 0 = ignore)",0,100000000000,2000000000,100000000)
+            if st.form_submit_button("Save rule"):add_rule(name,amt,lag,clu,rev);st.success("Rule saved.")
+        r=rules();st.dataframe(r,use_container_width=True,hide_index=True)
+        if len(d) and len(r):
+            x=d[d.transaction.astype(str).str.upper().str.startswith("P")].dropna(subset=["ticker"]).copy();x["cluster30"]=cluster_counts(x)
+            matches=[]
+            for _,rule in r[r.enabled==1].iterrows():
+                q=x[(x.est_amount.fillna(0)>=rule.min_amount)&(x.lag_days.fillna(999)<=rule.max_lag)&(x.cluster30>=rule.cluster_min)]
+                if rule.small_company_revenue>0:q=q[q.revenue.fillna(np.inf)<=rule.small_company_revenue]
+                if len(q):
+                    z=q.copy();z["matched_rule"]=rule["name"];matches.append(z)
+            if matches:
+                st.subheader("Current matches");st.dataframe(pd.concat(matches).sort_values("notification_date",ascending=False),use_container_width=True,hide_index=True)
 
-        st.subheader("Historical performance after public disclosure")
+    elif page=="Backtests":
+        if len(d):
+            x=d[d.transaction.astype(str).str.upper().str.startswith("P")].copy()
+
+            st.subheader("Historical performance after public disclosure")
+            st.caption(
+                "Signal = public notification date. The simulated entry is the first common trading day after "
+                "the disclosure. Returns use adjusted historical closing prices. SPY is the market benchmark."
+            )
+
+            h=st.selectbox("Holding period",[30,90,180],index=1,
+                           format_func=lambda v:f"{v} days after simulated entry")
+            who=st.selectbox("Politician",["All"]+sorted(x.politician.dropna().unique().tolist()))
+            if who!="All":x=x[x.politician==who]
+
+            rc=f"r{h}";bc=f"b{h}";ec=f"excess{h}"
+            y=x.dropna(subset=[rc]).copy()
+            pending=max(0,len(x)-len(y))
+
+            c1,c2,c3,c4=st.columns(4)
+            c1.metric("Completed (N)",len(y),help="Number of transactions with enough elapsed time and usable price data for this horizon.")
+            c2.metric("Positive return",f"{(y[rc]>0).mean():.1%}" if len(y) else "—",
+                      help="Share of completed cases where the stock return was above 0%.")
+            c3.metric("Outperformed SPY",f"{(y[ec]>0).mean():.1%}" if len(y) else "—",
+                      help="Share of completed cases where the stock return was higher than SPY over the same period.")
+            c4.metric("Median vs. SPY",f"{y[ec].median():.1%}" if len(y) else "—",
+                      help="Median stock return minus SPY return. Positive means above the benchmark; negative means below it.")
+
+            st.caption(f"Pending / not available for {h} days: {pending}")
+
+            show=y.sort_values("notification_date",ascending=False).copy()
+            rename={
+                "filing_id":"Filing ID","politician":"Politician","chamber":"Chamber","ticker":"Ticker",
+                "asset":"Asset","trade_date":"Trade date","notification_date":"Public notification",
+                "entry_date":"Simulated entry","entry_price":"Adjusted entry price",
+                rc:f"Stock return {h}d",bc:f"SPY return {h}d",ec:f"Excess vs SPY {h}d"
+            }
+            preferred=["filing_id","politician","chamber","ticker","asset","trade_date","notification_date",
+                       "entry_date","entry_price",rc,bc,ec]
+            cols=[c for c in preferred if c in show.columns]
+            table=show[cols].rename(columns=rename)
+            for c in [f"Stock return {h}d",f"SPY return {h}d",f"Excess vs SPY {h}d"]:
+                if c in table.columns:
+                    table[c]=table[c].apply(lambda v:"—" if pd.isna(v) else f"{v:.2%}")
+            st.dataframe(
+                table,use_container_width=True,hide_index=True,
+                column_config={"Adjusted entry price":st.column_config.NumberColumn(format="$%.4f")}
+            )
+
+            st.subheader("Validation sample")
+            st.caption(
+                "Use this table to audit individual calculations. 'Pending' means the required horizon has not "
+                "yet produced a usable observation; it is not counted as a completed result."
+            )
+            audit_cols=[c for c in ["politician","ticker","trade_date","notification_date","entry_date","entry_price",
+                                    "r30","b30","excess30","r90","b90","excess90","r180","b180","excess180"] if c in x.columns]
+            sample=x.sort_values("notification_date",ascending=False)[audit_cols].head(20).copy()
+            audit_rename={
+                "politician":"Politician","ticker":"Ticker","trade_date":"Trade date",
+                "notification_date":"Public notification","entry_date":"Simulated entry",
+                "entry_price":"Adjusted entry price",
+                "r30":"Stock 30d","b30":"SPY 30d","excess30":"Vs SPY 30d",
+                "r90":"Stock 90d","b90":"SPY 90d","excess90":"Vs SPY 90d",
+                "r180":"Stock 180d","b180":"SPY 180d","excess180":"Vs SPY 180d"
+            }
+            sample=sample.rename(columns=audit_rename)
+            for c in ["Stock 30d","SPY 30d","Vs SPY 30d","Stock 90d","SPY 90d","Vs SPY 90d",
+                      "Stock 180d","SPY 180d","Vs SPY 180d"]:
+                if c in sample.columns:
+                    sample[c]=sample[c].apply(lambda v:"Pending" if pd.isna(v) else f"{v:.2%}")
+            st.dataframe(sample,use_container_width=True,hide_index=True)
+
+            with st.expander("How to read these numbers"):
+                st.markdown("""
+    **Trade date** = date of the politician's reported transaction.  
+    **Public notification** = date the disclosure became public in our dataset.  
+    **Simulated entry** = first common trading day after the public notification.  
+    **Stock return** = historical stock performance after the simulated entry.  
+    **SPY return** = performance of the SPDR S&P 500 ETF over the same horizon.  
+    **Excess vs SPY** = stock return minus SPY return.  
+    **Pending** = the horizon is not yet complete or a usable observation is not available.
+
+    These are historical, descriptive results and do not establish that a disclosure caused the later price movement.
+    """)
+
+    elif page=="Analytics":
+        st.subheader("Analytics")
         st.caption(
-            "Signal = public notification date. The simulated entry is the first common trading day after "
-            "the disclosure. Returns use adjusted historical closing prices. SPY is the market benchmark."
+            "Descriptive analysis of publicly disclosed House transactions. Returns are historical results after "
+            "public notification; disclosed dollar amounts are ranges, not exact investment amounts."
         )
+        if len(d):
+            buys=d[d.transaction.astype(str).str.upper().str.startswith("P")].copy()
+            buys=buys.dropna(subset=["politician"])
 
-        h=st.selectbox("Holding period",[30,90,180],index=1,
-                       format_func=lambda v:f"{v} days after simulated entry")
-        who=st.selectbox("Politician",["All"]+sorted(x.politician.dropna().unique().tolist()))
-        if who!="All":x=x[x.politician==who]
+            tab1,tab2,tab3,tab4,tab5=st.tabs([
+                "Transactions","Disclosed volume","By politician","Largest purchases","Reporting lag"
+            ])
 
-        rc=f"r{h}";bc=f"b{h}";ec=f"excess{h}"
-        y=x.dropna(subset=[rc]).copy()
-        pending=max(0,len(x)-len(y))
-
-        c1,c2,c3,c4=st.columns(4)
-        c1.metric("Completed (N)",len(y),help="Number of transactions with enough elapsed time and usable price data for this horizon.")
-        c2.metric("Positive return",f"{(y[rc]>0).mean():.1%}" if len(y) else "—",
-                  help="Share of completed cases where the stock return was above 0%.")
-        c3.metric("Outperformed SPY",f"{(y[ec]>0).mean():.1%}" if len(y) else "—",
-                  help="Share of completed cases where the stock return was higher than SPY over the same period.")
-        c4.metric("Median vs. SPY",f"{y[ec].median():.1%}" if len(y) else "—",
-                  help="Median stock return minus SPY return. Positive means above the benchmark; negative means below it.")
-
-        st.caption(f"Pending / not available for {h} days: {pending}")
-
-        show=y.sort_values("notification_date",ascending=False).copy()
-        rename={
-            "filing_id":"Filing ID","politician":"Politician","chamber":"Chamber","ticker":"Ticker",
-            "asset":"Asset","trade_date":"Trade date","notification_date":"Public notification",
-            "entry_date":"Simulated entry","entry_price":"Adjusted entry price",
-            rc:f"Stock return {h}d",bc:f"SPY return {h}d",ec:f"Excess vs SPY {h}d"
-        }
-        preferred=["filing_id","politician","chamber","ticker","asset","trade_date","notification_date",
-                   "entry_date","entry_price",rc,bc,ec]
-        cols=[c for c in preferred if c in show.columns]
-        table=show[cols].rename(columns=rename)
-        for c in [f"Stock return {h}d",f"SPY return {h}d",f"Excess vs SPY {h}d"]:
-            if c in table.columns:
-                table[c]=table[c].apply(lambda v:"—" if pd.isna(v) else f"{v:.2%}")
-        st.dataframe(
-            table,use_container_width=True,hide_index=True,
-            column_config={"Adjusted entry price":st.column_config.NumberColumn(format="$%.4f")}
-        )
-
-        st.subheader("Validation sample")
-        st.caption(
-            "Use this table to audit individual calculations. 'Pending' means the required horizon has not "
-            "yet produced a usable observation; it is not counted as a completed result."
-        )
-        audit_cols=[c for c in ["politician","ticker","trade_date","notification_date","entry_date","entry_price",
-                                "r30","b30","excess30","r90","b90","excess90","r180","b180","excess180"] if c in x.columns]
-        sample=x.sort_values("notification_date",ascending=False)[audit_cols].head(20).copy()
-        audit_rename={
-            "politician":"Politician","ticker":"Ticker","trade_date":"Trade date",
-            "notification_date":"Public notification","entry_date":"Simulated entry",
-            "entry_price":"Adjusted entry price",
-            "r30":"Stock 30d","b30":"SPY 30d","excess30":"Vs SPY 30d",
-            "r90":"Stock 90d","b90":"SPY 90d","excess90":"Vs SPY 90d",
-            "r180":"Stock 180d","b180":"SPY 180d","excess180":"Vs SPY 180d"
-        }
-        sample=sample.rename(columns=audit_rename)
-        for c in ["Stock 30d","SPY 30d","Vs SPY 30d","Stock 90d","SPY 90d","Vs SPY 90d",
-                  "Stock 180d","SPY 180d","Vs SPY 180d"]:
-            if c in sample.columns:
-                sample[c]=sample[c].apply(lambda v:"Pending" if pd.isna(v) else f"{v:.2%}")
-        st.dataframe(sample,use_container_width=True,hide_index=True)
-
-        with st.expander("How to read these numbers"):
-            st.markdown("""
-**Trade date** = date of the politician's reported transaction.  
-**Public notification** = date the disclosure became public in our dataset.  
-**Simulated entry** = first common trading day after the public notification.  
-**Stock return** = historical stock performance after the simulated entry.  
-**SPY return** = performance of the SPDR S&P 500 ETF over the same horizon.  
-**Excess vs SPY** = stock return minus SPY return.  
-**Pending** = the horizon is not yet complete or a usable observation is not available.
-
-These are historical, descriptive results and do not establish that a disclosure caused the later price movement.
-""")
-
-elif page=="Analytics":
-    st.subheader("Analytics")
-    st.caption(
-        "Descriptive analysis of publicly disclosed House transactions. Returns are historical results after "
-        "public notification; disclosed dollar amounts are ranges, not exact investment amounts."
-    )
-    if len(d):
-        buys=d[d.transaction.astype(str).str.upper().str.startswith("P")].copy()
-        buys=buys.dropna(subset=["politician"])
-
-        tab1,tab2,tab3,tab4,tab5=st.tabs([
-            "Transactions","Disclosed volume","By politician","Largest purchases","Reporting lag"
-        ])
-
-        with tab1:
-            st.markdown("### Historical transaction outcomes")
-            horizon=st.selectbox("Return horizon",[30,90,180],index=1,key="analytics_h")
-            metric=st.selectbox("Sort by",["Stock return","Excess vs SPY"],key="analytics_metric")
-            rc=f"r{horizon}";bc=f"b{horizon}";ec=f"excess{horizon}"
-            q=buys.dropna(subset=[rc]).copy()
-            sortcol=rc if metric=="Stock return" else ec
-            q=q.sort_values(sortcol,ascending=False)
-            cols=[c for c in ["politician","ticker","asset","trade_date","notification_date","lag_days",
-                               "amount_low","amount_high","est_amount",rc,bc,ec] if c in q.columns]
-            q=q[cols].rename(columns={
-                "politician":"Politician","ticker":"Ticker","asset":"Asset","trade_date":"Trade date",
-                "notification_date":"Public notification","lag_days":"Reporting lag (days)",
-                "amount_low":"Disclosed min","amount_high":"Disclosed max","est_amount":"Estimated midpoint",
-                rc:f"Stock {horizon}d",bc:f"SPY {horizon}d",ec:f"Vs SPY {horizon}d"
-            })
-            for c in [f"Stock {horizon}d",f"SPY {horizon}d",f"Vs SPY {horizon}d"]:
-                if c in q:q[c]=q[c].apply(lambda v:"—" if pd.isna(v) else f"{v:.2%}")
-            st.dataframe(q,use_container_width=True,hide_index=True)
-            st.caption(f"Completed observations for {horizon} days: {len(q)}. Sort order is descriptive, not a forecast.")
-
-        with tab2:
-            st.markdown("### Disclosed purchase volume by politician")
-            v=buys.dropna(subset=["amount_low","amount_high"]).copy()
-            if len(v):
-                g=v.groupby("politician",as_index=False).agg(
-                    purchases=("ticker","size"),
-                    disclosed_min=("amount_low","sum"),
-                    disclosed_max=("amount_high","sum"),
-                    estimated_midpoint=("est_amount","sum")
-                ).sort_values("estimated_midpoint",ascending=False)
-                g=g.rename(columns={
-                    "politician":"Politician","purchases":"Purchases",
-                    "disclosed_min":"Sum of disclosed minima",
-                    "disclosed_max":"Sum of disclosed maxima",
-                    "estimated_midpoint":"Estimated midpoint total"
-                })
-                st.dataframe(g,use_container_width=True,hide_index=True,
-                    column_config={
-                        "Sum of disclosed minima":st.column_config.NumberColumn(format="$%.0f"),
-                        "Sum of disclosed maxima":st.column_config.NumberColumn(format="$%.0f"),
-                        "Estimated midpoint total":st.column_config.NumberColumn(format="$%.0f")
-                    })
-                st.info("The midpoint is only an estimate derived from each disclosed amount range. It is not the politician's exact invested amount.")
-            else: st.info("No disclosed amount ranges available.")
-
-        with tab3:
-            st.markdown("### Historical results by politician")
-            h2=st.selectbox("Evaluation horizon",[30,90,180],index=1,key="analytics_pol_h")
-            r=f"r{h2}";e=f"excess{h2}"
-            z=buys.dropna(subset=[r,e]).copy()
-            if len(z):
-                rows=[]
-                for name,gp in z.groupby("politician"):
-                    rows.append({
-                        "Politician":name,
-                        "Completed N":len(gp),
-                        f"Median stock {h2}d":gp[r].median(),
-                        f"Median vs SPY {h2}d":gp[e].median(),
-                        "Positive cases":(gp[r]>0).mean(),
-                        "Cases above SPY":(gp[e]>0).mean()
-                    })
-                p=pd.DataFrame(rows).sort_values(["Completed N","Politician"],ascending=[False,True])
-                for c in [f"Median stock {h2}d",f"Median vs SPY {h2}d","Positive cases","Cases above SPY"]:
-                    p[c]=p[c].apply(lambda v:f"{v:.1%}")
-                st.dataframe(p,use_container_width=True,hide_index=True)
-                st.caption("Completed N is shown so results from a small number of disclosures are not confused with larger samples.")
-            else: st.info("No completed observations for this horizon.")
-
-        with tab4:
-            st.markdown("### Largest disclosed individual purchases")
-            q=buys.dropna(subset=["amount_low","amount_high"]).copy()
-            if len(q):
-                q=q.sort_values(["est_amount","notification_date"],ascending=[False,False])
-                cols=[c for c in ["politician","ticker","asset","trade_date","notification_date",
-                                   "amount_low","amount_high","est_amount","r30","r90","r180"] if c in q.columns]
+            with tab1:
+                st.markdown("### Historical transaction outcomes")
+                horizon=st.selectbox("Return horizon",[30,90,180],index=1,key="analytics_h")
+                metric=st.selectbox("Sort by",["Stock return","Excess vs SPY"],key="analytics_metric")
+                rc=f"r{horizon}";bc=f"b{horizon}";ec=f"excess{horizon}"
+                q=buys.dropna(subset=[rc]).copy()
+                sortcol=rc if metric=="Stock return" else ec
+                q=q.sort_values(sortcol,ascending=False)
+                cols=[c for c in ["politician","ticker","asset","trade_date","notification_date","lag_days",
+                                   "amount_low","amount_high","est_amount",rc,bc,ec] if c in q.columns]
                 q=q[cols].rename(columns={
                     "politician":"Politician","ticker":"Ticker","asset":"Asset","trade_date":"Trade date",
-                    "notification_date":"Public notification","amount_low":"Disclosed min",
-                    "amount_high":"Disclosed max","est_amount":"Estimated midpoint",
-                    "r30":"Stock 30d","r90":"Stock 90d","r180":"Stock 180d"
+                    "notification_date":"Public notification","lag_days":"Reporting lag (days)",
+                    "amount_low":"Disclosed min","amount_high":"Disclosed max","est_amount":"Estimated midpoint",
+                    rc:f"Stock {horizon}d",bc:f"SPY {horizon}d",ec:f"Vs SPY {horizon}d"
                 })
-                for c in ["Stock 30d","Stock 90d","Stock 180d"]:
-                    if c in q:q[c]=q[c].apply(lambda v:"Pending" if pd.isna(v) else f"{v:.2%}")
-                st.dataframe(q,use_container_width=True,hide_index=True,
-                    column_config={
-                        "Disclosed min":st.column_config.NumberColumn(format="$%.0f"),
-                        "Disclosed max":st.column_config.NumberColumn(format="$%.0f"),
-                        "Estimated midpoint":st.column_config.NumberColumn(format="$%.0f")
-                    })
-                st.caption("Ordered by the estimated midpoint of the disclosed range; exact purchase amounts are generally not disclosed.")
-
-        with tab5:
-            st.markdown("### Reporting lag")
-            q=buys.dropna(subset=["trade_date","notification_date","lag_days"]).copy()
-            if len(q):
-                c1,c2,c3=st.columns(3)
-                c1.metric("Median lag",f"{q.lag_days.median():.0f} days")
-                c2.metric("Average lag",f"{q.lag_days.mean():.1f} days")
-                c3.metric("Observed purchases",len(q))
-                cols=[c for c in ["politician","ticker","asset","trade_date","notification_date","lag_days"] if c in q.columns]
-                q=q.sort_values("lag_days",ascending=False)[cols].rename(columns={
-                    "politician":"Politician","ticker":"Ticker","asset":"Asset","trade_date":"Trade date",
-                    "notification_date":"Public notification","lag_days":"Reporting lag (days)"
-                })
+                for c in [f"Stock {horizon}d",f"SPY {horizon}d",f"Vs SPY {horizon}d"]:
+                    if c in q:q[c]=q[c].apply(lambda v:"—" if pd.isna(v) else f"{v:.2%}")
                 st.dataframe(q,use_container_width=True,hide_index=True)
-                st.caption("Reporting lag = public notification date minus reported transaction date.")
+                st.caption(f"Completed observations for {horizon} days: {len(q)}. Sort order is descriptive, not a forecast.")
 
-elif page=="Politicians":
-    if len(d):
-        who=st.selectbox("Politician",sorted(d.politician.unique()));x=d[d.politician==who]
-        if st.button("Watch politician"):add_watch("politician",who);st.success("Added.")
-        st.dataframe(x.sort_values("notification_date",ascending=False),use_container_width=True,hide_index=True)
+            with tab2:
+                st.markdown("### Disclosed purchase volume by politician")
+                v=buys.dropna(subset=["amount_low","amount_high"]).copy()
+                if len(v):
+                    g=v.groupby("politician",as_index=False).agg(
+                        purchases=("ticker","size"),
+                        disclosed_min=("amount_low","sum"),
+                        disclosed_max=("amount_high","sum"),
+                        estimated_midpoint=("est_amount","sum")
+                    ).sort_values("estimated_midpoint",ascending=False)
+                    g=g.rename(columns={
+                        "politician":"Politician","purchases":"Purchases",
+                        "disclosed_min":"Sum of disclosed minima",
+                        "disclosed_max":"Sum of disclosed maxima",
+                        "estimated_midpoint":"Estimated midpoint total"
+                    })
+                    for c in ["Sum of disclosed minima","Sum of disclosed maxima","Estimated midpoint total"]:
+                        g[c]=g[c].apply(lambda v:f"${v:,.0f}")
+                    st.dataframe(g,use_container_width=True,hide_index=True)
+                    st.info("The midpoint is only an estimate derived from each disclosed amount range. It is not the politician's exact invested amount.")
+                else: st.info("No disclosed amount ranges available.")
 
-elif page=="Companies":
-    if len(d):
-        t=st.selectbox("Ticker",sorted(d.ticker.dropna().unique()));x=d[d.ticker==t];r=x.iloc[0]
-        st.subheader(f'{r.get("company") if pd.notna(r.get("company")) else t} ({t})')
-        st.dataframe(x.sort_values("notification_date",ascending=False),use_container_width=True,hide_index=True)
+            with tab3:
+                st.markdown("### Historical results by politician")
+                h2=st.selectbox("Evaluation horizon",[30,90,180],index=1,key="analytics_pol_h")
+                r=f"r{h2}";e=f"excess{h2}"
+                z=buys.dropna(subset=[r,e]).copy()
+                if len(z):
+                    rows=[]
+                    for name,gp in z.groupby("politician"):
+                        rows.append({
+                            "Politician":name,
+                            "Completed N":len(gp),
+                            f"Median stock {h2}d":gp[r].median(),
+                            f"Median vs SPY {h2}d":gp[e].median(),
+                            "Positive cases":(gp[r]>0).mean(),
+                            "Cases above SPY":(gp[e]>0).mean()
+                        })
+                    p=pd.DataFrame(rows).sort_values(["Completed N","Politician"],ascending=[False,True])
+                    for c in [f"Median stock {h2}d",f"Median vs SPY {h2}d","Positive cases","Cases above SPY"]:
+                        p[c]=p[c].apply(lambda v:f"{v:.1%}")
+                    st.dataframe(p,use_container_width=True,hide_index=True)
+                    st.caption("Completed N is shown so results from a small number of disclosures are not confused with larger samples.")
+                else: st.info("No completed observations for this horizon.")
 
-elif page=="Data Quality":
-    if len(d):
-        q=d.apply(quality,axis=1);x=d.copy();x["quality_score"]=[a for a,b in q];x["quality_note"]=[b for a,b in q]
-        c1,c2,c3=st.columns(3);c1.metric("Rows",len(x));c2.metric("Median quality",f"{x.quality_score.median():.0f}/100")
-        c3.metric("Rows <70",int((x.quality_score<70).sum()))
-        st.dataframe(x.sort_values(["quality_score","notification_date"]),use_container_width=True,hide_index=True)
+            with tab4:
+                st.markdown("### Largest disclosed individual purchases")
+                q=buys.dropna(subset=["amount_low","amount_high"]).copy()
+                if len(q):
+                    q=q.sort_values(["est_amount","notification_date"],ascending=[False,False])
+                    cols=[c for c in ["politician","ticker","asset","trade_date","notification_date",
+                                       "amount_low","amount_high","est_amount","r30","r90","r180"] if c in q.columns]
+                    q=q[cols].rename(columns={
+                        "politician":"Politician","ticker":"Ticker","asset":"Asset","trade_date":"Trade date",
+                        "notification_date":"Public notification","amount_low":"Disclosed min",
+                        "amount_high":"Disclosed max","est_amount":"Estimated midpoint",
+                        "r30":"Stock 30d","r90":"Stock 90d","r180":"Stock 180d"
+                    })
+                    for c in ["Stock 30d","Stock 90d","Stock 180d"]:
+                        if c in q:q[c]=q[c].apply(lambda v:"Pending" if pd.isna(v) else f"{v:.2%}")
+                    for c in ["Disclosed min","Disclosed max","Estimated midpoint"]:
+                        q[c]=q[c].apply(lambda v:f"${v:,.0f}")
+                    st.dataframe(q,use_container_width=True,hide_index=True)
+                    st.caption("Ordered by the estimated midpoint of the disclosed range; exact purchase amounts are generally not disclosed.")
 
-else:
-    st.markdown("""
-### Source policy
-**House:** official U.S. House Periodic Transaction Reports are primary evidence.  
-**SEC:** public Company Facts data enriches listed-company fundamentals.  
-**Market prices:** free yfinance convenience layer, kept separate and replaceable.  
-**Senate:** intentionally remains a separate adapter until an official-source ingestion path is robust enough for automated production use.
+            with tab5:
+                st.markdown("### Reporting lag")
+                q=buys.dropna(subset=["trade_date","notification_date","lag_days"]).copy()
+                if len(q):
+                    c1,c2,c3=st.columns(3)
+                    c1.metric("Median lag",f"{q.lag_days.median():.0f} days")
+                    c2.metric("Average lag",f"{q.lag_days.mean():.1f} days")
+                    c3.metric("Observed purchases",len(q))
+                    cols=[c for c in ["politician","ticker","asset","trade_date","notification_date","lag_days"] if c in q.columns]
+                    q=q.sort_values("lag_days",ascending=False)[cols].rename(columns={
+                        "politician":"Politician","ticker":"Ticker","asset":"Asset","trade_date":"Trade date",
+                        "notification_date":"Public notification","lag_days":"Reporting lag (days)"
+                    })
+                    st.dataframe(q,use_container_width=True,hide_index=True)
+                    st.caption("Reporting lag = public notification date minus reported transaction date.")
 
-### Quality policy
-Every disclosure can be checked for ticker, dates, amount band, source link and plausible reporting lag.
-A low quality score means the row needs verification; it does not mean the filing itself is false.
+    elif page=="Politicians":
+        if len(d):
+            who=st.selectbox("Politician",sorted(d.politician.unique()));x=d[d.politician==who]
+            if st.button("Watch politician"):add_watch("politician",who);st.success("Added.")
+            st.dataframe(x.sort_values("notification_date",ascending=False),use_container_width=True,hide_index=True)
 
-### Alerts
-Saved rules are research filters. They do not predict future returns and do not imply wrongdoing.
-Historical backtests use the first market session after public disclosure to reduce look-ahead bias.
-""")
+    elif page=="Companies":
+        if len(d):
+            t=st.selectbox("Ticker",sorted(d.ticker.dropna().unique()));x=d[d.ticker==t];r=x.iloc[0]
+            st.subheader(f'{r.get("company") if pd.notna(r.get("company")) else t} ({t})')
+            st.dataframe(x.sort_values("notification_date",ascending=False),use_container_width=True,hide_index=True)
+
+    elif page=="Data Quality":
+        if len(d):
+            q=d.apply(quality,axis=1);x=d.copy();x["quality_score"]=[a for a,b in q];x["quality_note"]=[b for a,b in q]
+            c1,c2,c3=st.columns(3);c1.metric("Rows",len(x));c2.metric("Median quality",f"{x.quality_score.median():.0f}/100")
+            c3.metric("Rows <70",int((x.quality_score<70).sum()))
+            st.dataframe(x.sort_values(["quality_score","notification_date"]),use_container_width=True,hide_index=True)
+
+    else:
+        st.markdown("""
+    ### Source policy
+    **House:** official U.S. House Periodic Transaction Reports are primary evidence.  
+    **SEC:** public Company Facts data enriches listed-company fundamentals.  
+    **Market prices:** free yfinance convenience layer, kept separate and replaceable.  
+    **Senate:** intentionally remains a separate adapter until an official-source ingestion path is robust enough for automated production use.
+
+    ### Quality policy
+    Every disclosure can be checked for ticker, dates, amount band, source link and plausible reporting lag.
+    A low quality score means the row needs verification; it does not mean the filing itself is false.
+
+    ### Alerts
+    Saved rules are research filters. They do not predict future returns and do not imply wrongdoing.
+    Historical backtests use the first market session after public disclosure to reduce look-ahead bias.
+    """)
